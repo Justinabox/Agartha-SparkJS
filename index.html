@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agartha World</title>
+    <style>
+      body {
+        margin: 0;
+      }
+    </style>
+  </head>
+
+  <body>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.180.0/three.module.js",
+          "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/0.1.10/spark.module.js"
+        }
+      }
+    </script>
+    <script type="module">
+      import * as THREE from 'three';
+      import { SplatMesh } from '@sparkjsdev/spark';
+
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(
+        60,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000
+      );
+      const renderer = new THREE.WebGLRenderer();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      document.body.appendChild(renderer.domElement);
+
+      // Read model name from URL (?model=<name>) and build asset paths
+      const params = new URLSearchParams(window.location.search);
+      const modelName = params.get('model') || 'agartha-world';
+      const placeholderURL = `./assets/${modelName}.jpg`;
+      const splatURL = `./assets/${modelName}.spz`;
+
+      // Placeholder overlay image covering entire canvas/viewport
+      const placeholder = document.createElement('img');
+      placeholder.src = placeholderURL;
+      placeholder.alt = `${modelName} placeholder`;
+      Object.assign(placeholder.style, {
+        position: 'fixed',
+        inset: '0',
+        width: '100%',
+        height: '100%',
+        objectFit: 'cover',
+        zIndex: '9999',
+        backgroundColor: '#000',
+        // Keep interactions usable beneath if desired
+        pointerEvents: 'none'
+      });
+      document.body.appendChild(placeholder);
+
+      const world = new SplatMesh({
+        url: splatURL,
+        onLoad: () => {
+          // Remove placeholder after first rendered frame post-load
+          if (placeholder && placeholder.parentNode) {
+            console.log('placeholder removed');
+            requestAnimationFrame(() => placeholder.remove());
+          }
+        }
+      });
+      world.quaternion.set(1, 0, 0, 0);
+    //   butterfly.position.set(0, 0, -3);
+      scene.add(world);
+
+      // Controls: mouse drag rotation + hover parallax lookAt
+      const canvas = renderer.domElement;
+      camera.rotation.order = 'YXZ';
+      let isDragging = false;
+      let lastMouseX = 0;
+      let lastMouseY = 0;
+      let yaw = camera.rotation.y;
+      let pitch = camera.rotation.x;
+      const rotationSpeed = 0.003; // drag sensitivity
+
+      // Hover parallax
+      let hoverActive = false;
+      let hoverOffsetX = 0; // [-0.5, 0.5] relative to canvas center
+      let hoverOffsetY = 0; // [-0.5, 0.5] relative to canvas center
+      const parallaxStrength = 0.1; // world units shift
+      const baseLookAt = new THREE.Vector3();
+      const targetLookAt = new THREE.Vector3();
+      const currentLookAt = new THREE.Vector3();
+
+      // Initialize lookAt to be straight ahead from the camera
+      (function initLookAt() {
+        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+        baseLookAt.copy(camera.position).add(forward);
+        targetLookAt.copy(baseLookAt);
+        currentLookAt.copy(baseLookAt);
+      })();
+
+      function updateHoverFromEvent(e) {
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX;
+        const y = e.clientY;
+        const inside =
+          x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+        hoverActive = inside;
+        if (!inside) return;
+        const nx = (x - rect.left) / rect.width; // [0,1]
+        const ny = (y - rect.top) / rect.height; // [0,1]
+        hoverOffsetX = nx - 0.5;
+        hoverOffsetY = ny - 0.5;
+      }
+
+      function onMouseDown(e) {
+        isDragging = true;
+        lastMouseX = e.clientX;
+        lastMouseY = e.clientY;
+        // start from current camera euler
+        yaw = camera.rotation.y;
+        pitch = camera.rotation.x;
+      }
+
+      function onMouseMove(e) {
+        if (isDragging) {
+          const dx = e.clientX - lastMouseX;
+          const dy = e.clientY - lastMouseY;
+          lastMouseX = e.clientX;
+          lastMouseY = e.clientY;
+
+          yaw -= dx * rotationSpeed;
+          pitch -= dy * rotationSpeed;
+          const maxPitch = Math.PI / 2 - 0.01;
+          if (pitch > maxPitch) pitch = maxPitch;
+          if (pitch < -maxPitch) pitch = -maxPitch;
+          camera.rotation.set(pitch, yaw, 0);
+        } else {
+          updateHoverFromEvent(e);
+        }
+      }
+
+      function onMouseUp() {
+        if (!isDragging) return;
+        isDragging = false;
+        // After dragging, lock baseLookAt to the current forward direction
+        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+        baseLookAt.copy(camera.position).add(forward);
+        // Sync lookAt targets immediately to avoid snap-back
+        targetLookAt.copy(baseLookAt);
+        currentLookAt.copy(baseLookAt);
+        camera.lookAt(currentLookAt);
+      }
+
+      function onMouseLeave() {
+        hoverActive = false;
+      }
+
+      function onMouseEnter(e) {
+        updateHoverFromEvent(e);
+      }
+      function onResize() {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      }
+
+      canvas.addEventListener('mousedown', onMouseDown);
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('mouseup', onMouseUp);
+      canvas.addEventListener('mouseleave', onMouseLeave);
+      canvas.addEventListener('mouseenter', onMouseEnter);
+
+      // Resize handling
+      window.addEventListener('resize', onResize);
+
+      let lastTime;
+      renderer.setAnimationLoop(function animate(time) {
+        const deltaTime = time - (lastTime || time);
+        lastTime = time;
+        // Hover parallax when not dragging
+        if (!isDragging) {
+          if (hoverActive) {
+            targetLookAt
+              .copy(baseLookAt)
+              .add(new THREE.Vector3(hoverOffsetX * parallaxStrength, -hoverOffsetY * parallaxStrength, 0));
+          } else {
+            targetLookAt.copy(baseLookAt);
+          }
+          // Smooth towards target
+          currentLookAt.lerp(targetLookAt, 0.1);
+          camera.lookAt(currentLookAt);
+        }
+        renderer.render(scene, camera);
+        // butterfly.rotation.y += deltaTime / 2500;
+      });
+
+      // Cleanup listeners if page unloads
+      window.addEventListener('beforeunload', () => {
+        canvas.removeEventListener('mousedown', onMouseDown);
+        window.removeEventListener('mousemove', onMouseMove);
+        window.removeEventListener('mouseup', onMouseUp);
+        canvas.removeEventListener('mouseleave', onMouseLeave);
+        canvas.removeEventListener('mouseenter', onMouseEnter);
+        window.removeEventListener('resize', onResize);
+      });
+    </script>
+  </body>
+</html>
