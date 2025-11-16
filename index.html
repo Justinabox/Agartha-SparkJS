@@ -33,6 +33,11 @@
       );
       const renderer = new THREE.WebGLRenderer();
       renderer.setSize(window.innerWidth, window.innerHeight);
+      // Start canvas invisible so we can fade it in once the splat is ready
+      Object.assign(renderer.domElement.style, {
+        opacity: '0',
+        transition: 'opacity 600ms ease'
+      });
       document.body.appendChild(renderer.domElement);
 
       // Read model name from URL (?model=<name>) and build asset paths
@@ -53,6 +58,8 @@
         objectFit: 'cover',
         zIndex: '9999',
         backgroundColor: '#000',
+        opacity: '1',
+        transition: 'opacity 600ms ease',
         // Keep interactions usable beneath if desired
         pointerEvents: 'none'
       });
@@ -61,43 +68,69 @@
       const world = new SplatMesh({
         url: splatURL,
         onLoad: () => {
-          // Remove placeholder after first rendered frame post-load
-          if (placeholder && placeholder.parentNode) {
-            console.log('placeholder removed');
-            requestAnimationFrame(() => placeholder.remove());
-          }
+          // Fade in canvas and fade out placeholder instead of hard-cut "shutter"
+          // Ensure at least one rendered frame before we start transitions
+          requestAnimationFrame(() => {
+            // Fade in the WebGL canvas
+            renderer.domElement.style.opacity = '1';
+
+            // Fade out the placeholder image, then remove it from the DOM
+            if (placeholder && placeholder.parentNode) {
+              console.log('placeholder fade-out start');
+              placeholder.style.opacity = '0';
+              const handleTransitionEnd = () => {
+                placeholder.removeEventListener('transitionend', handleTransitionEnd);
+                if (placeholder.parentNode) {
+                  placeholder.parentNode.removeChild(placeholder);
+                }
+              };
+              placeholder.addEventListener('transitionend', handleTransitionEnd);
+            }
+          });
         }
       });
       world.quaternion.set(1, 0, 0, 0);
     //   butterfly.position.set(0, 0, -3);
       scene.add(world);
 
-      // Controls: mouse drag rotation + hover parallax lookAt
+      // Controls: mouse drag + hover orbiting around a focus point
       const canvas = renderer.domElement;
-      camera.rotation.order = 'YXZ';
       let isDragging = false;
       let lastMouseX = 0;
       let lastMouseY = 0;
-      let yaw = camera.rotation.y;
-      let pitch = camera.rotation.x;
-      const rotationSpeed = 0.003; // drag sensitivity
+      const rotationSpeed = 0.003; // angular drag sensitivity
 
-      // Hover parallax
+      // Orbit state (camera moves on a sphere around focusPoint)
+      const focusPoint = new THREE.Vector3();
+      const orbitVector = new THREE.Vector3();
+      const orbitSpherical = new THREE.Spherical();
+      const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+      focusPoint.copy(camera.position).add(forward);
+      orbitVector.copy(camera.position).sub(focusPoint);
+      if (orbitVector.lengthSq() < 1e-6) {
+        orbitVector.set(0, 0, 1);
+      }
+      orbitSpherical.setFromVector3(orbitVector);
+      const orbitState = {
+        radius: Math.max(orbitSpherical.radius, 0.5),
+        theta: orbitSpherical.theta,
+        phi: orbitSpherical.phi
+      };
+      const minPolarAngle = 0.1;
+      const maxPolarAngle = Math.PI - 0.1;
+
+      // Hover orbit offsets (adds subtle motion on same sphere)
       let hoverActive = false;
       let hoverOffsetX = 0; // [-0.5, 0.5] relative to canvas center
       let hoverOffsetY = 0; // [-0.5, 0.5] relative to canvas center
-      const parallaxStrength = 0.1; // world units shift
-      const baseLookAt = new THREE.Vector3();
-      const targetLookAt = new THREE.Vector3();
-      const currentLookAt = new THREE.Vector3();
-
-      // Initialize lookAt to be straight ahead from the camera
-      (function initLookAt() {
-        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
-        baseLookAt.copy(camera.position).add(forward);
-        targetLookAt.copy(baseLookAt);
-        currentLookAt.copy(baseLookAt);
-      })();
+      const hoverAngles = {
+        targetTheta: 0,
+        targetPhi: 0,
+        currentTheta: 0,
+        currentPhi: 0
+      };
+      const hoverAngleStrength = 0.2; // radians, max angular offset from hover
+      const hoverLerp = 0.03; // lower = smoother, slower response
 
       function updateHoverFromEvent(e) {
         const rect = canvas.getBoundingClientRect();
@@ -106,54 +139,57 @@
         const inside =
           x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
         hoverActive = inside;
-        if (!inside) return;
+        if (!inside) {
+          hoverAngles.targetTheta = 0;
+          hoverAngles.targetPhi = 0;
+          return;
+        }
         const nx = (x - rect.left) / rect.width; // [0,1]
         const ny = (y - rect.top) / rect.height; // [0,1]
         hoverOffsetX = nx - 0.5;
         hoverOffsetY = ny - 0.5;
+        hoverAngles.targetTheta = hoverOffsetX * hoverAngleStrength;
+        hoverAngles.targetPhi = hoverOffsetY * hoverAngleStrength;
       }
 
       function onMouseDown(e) {
         isDragging = true;
         lastMouseX = e.clientX;
         lastMouseY = e.clientY;
-        // start from current camera euler
-        yaw = camera.rotation.y;
-        pitch = camera.rotation.x;
+        // keep current hover displacement so view does not snap when starting drag
       }
 
       function onMouseMove(e) {
+        // Always keep hover offsets in sync with pointer position
+        updateHoverFromEvent(e);
         if (isDragging) {
           const dx = e.clientX - lastMouseX;
           const dy = e.clientY - lastMouseY;
           lastMouseX = e.clientX;
           lastMouseY = e.clientY;
 
-          yaw -= dx * rotationSpeed;
-          pitch -= dy * rotationSpeed;
-          const maxPitch = Math.PI / 2 - 0.01;
-          if (pitch > maxPitch) pitch = maxPitch;
-          if (pitch < -maxPitch) pitch = -maxPitch;
-          camera.rotation.set(pitch, yaw, 0);
-        } else {
+          orbitState.theta -= dx * rotationSpeed;
+          orbitState.phi -= dy * rotationSpeed;
+          orbitState.phi = THREE.MathUtils.clamp(
+            orbitState.phi,
+            minPolarAngle,
+            maxPolarAngle
+          );
+        }
+      }
+
+      function onMouseUp(e) {
+        if (!isDragging) return;
+        isDragging = false;
+        if (e) {
           updateHoverFromEvent(e);
         }
       }
 
-      function onMouseUp() {
-        if (!isDragging) return;
-        isDragging = false;
-        // After dragging, lock baseLookAt to the current forward direction
-        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
-        baseLookAt.copy(camera.position).add(forward);
-        // Sync lookAt targets immediately to avoid snap-back
-        targetLookAt.copy(baseLookAt);
-        currentLookAt.copy(baseLookAt);
-        camera.lookAt(currentLookAt);
-      }
-
       function onMouseLeave() {
         hoverActive = false;
+        hoverAngles.targetTheta = 0;
+        hoverAngles.targetPhi = 0;
       }
 
       function onMouseEnter(e) {
@@ -174,23 +210,29 @@
       // Resize handling
       window.addEventListener('resize', onResize);
 
-      let lastTime;
-      renderer.setAnimationLoop(function animate(time) {
-        const deltaTime = time - (lastTime || time);
-        lastTime = time;
-        // Hover parallax when not dragging
-        if (!isDragging) {
-          if (hoverActive) {
-            targetLookAt
-              .copy(baseLookAt)
-              .add(new THREE.Vector3(hoverOffsetX * parallaxStrength, -hoverOffsetY * parallaxStrength, 0));
-          } else {
-            targetLookAt.copy(baseLookAt);
-          }
-          // Smooth towards target
-          currentLookAt.lerp(targetLookAt, 0.1);
-          camera.lookAt(currentLookAt);
-        }
+      renderer.setAnimationLoop(function animate() {
+        // Smooth hover offsets towards target when pointer is inside canvas
+        const hoverTargetTheta = hoverActive ? hoverAngles.targetTheta : 0;
+        const hoverTargetPhi = hoverActive ? hoverAngles.targetPhi : 0;
+        // Slightly faster response while dragging so view keeps up with the pointer
+        const lerpFactor = isDragging ? hoverLerp * 1.5 : hoverLerp;
+        hoverAngles.currentTheta += (hoverTargetTheta - hoverAngles.currentTheta) * lerpFactor;
+        hoverAngles.currentPhi += (hoverTargetPhi - hoverAngles.currentPhi) * lerpFactor;
+
+        // Combine drag + hover offsets to move camera on orbit sphere
+        const finalTheta = orbitState.theta + hoverAngles.currentTheta;
+        const finalPhi = THREE.MathUtils.clamp(
+          orbitState.phi + hoverAngles.currentPhi,
+          minPolarAngle,
+          maxPolarAngle
+        );
+        orbitSpherical.radius = orbitState.radius;
+        orbitSpherical.theta = finalTheta;
+        orbitSpherical.phi = finalPhi;
+        orbitVector.setFromSpherical(orbitSpherical);
+        camera.position.copy(focusPoint).add(orbitVector);
+        camera.lookAt(focusPoint);
+
         renderer.render(scene, camera);
         // butterfly.rotation.y += deltaTime / 2500;
       });
